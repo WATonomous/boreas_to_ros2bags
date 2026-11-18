@@ -4,3 +4,4 @@ __pycache__
 *.db3
 bags
 data
+boreas-config.local.sh

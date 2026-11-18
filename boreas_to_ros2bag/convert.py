@@ -5,6 +5,7 @@ from collections import Counter
 import hashlib
 import heapq
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -119,8 +120,12 @@ def gnss_stream(sequence, begin, end, uncertainty, status):
 
 def make_parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--input', type=Path, required=True, help='One Boreas sequence directory')
-    parser.add_argument('--output', type=Path, required=True, help='New ROS 2 bag directory')
+    data_root, sequence = os.environ.get('BOREAS_DATA_ROOT'), os.environ.get('BOREAS_SEQUENCE')
+    default_input = Path(data_root) / sequence if data_root and sequence else None
+    parser.add_argument('--input', type=Path, default=default_input, required=default_input is None,
+                        help='One Boreas sequence directory; defaults to configured data root/sequence')
+    parser.add_argument('--output', type=Path, required=True,
+                        help='New bag name under the configured bag root, or an absolute directory path')
     parser.add_argument('--sensors', nargs='+', choices=['lidar','imu','camera','gnss'],
                         default=['lidar','imu'],
                         help='Streams to export (default: lidar imu); gnss is post-processed ground truth')
@@ -138,7 +143,10 @@ def make_parser():
 
 
 def convert(args):
-    sequence, output = args.input.resolve(), args.output.resolve()
+    output = args.output
+    if not output.is_absolute() and os.environ.get('BOREAS_BAG_ROOT'):
+        output = Path(os.environ['BOREAS_BAG_ROOT']) / output
+    sequence, output = args.input.resolve(), output.resolve()
     if output == sequence or sequence in output.parents:
         raise ValueError('Output must be outside the raw sequence')
     if output.exists():

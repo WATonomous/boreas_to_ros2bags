@@ -3,6 +3,7 @@
 import argparse
 from collections import Counter
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -21,6 +22,8 @@ def require(condition, message):
 
 
 def validate(path, compare_source=False):
+    if not path.is_absolute() and os.environ.get('BOREAS_BAG_ROOT'):
+        path = Path(os.environ['BOREAS_BAG_ROOT']) / path
     report = json.loads((path/'conversion.json').read_text())
     reader = bag.SequentialReader()
     reader.open(bag.StorageOptions(uri=str(path), storage_id='mcap'), bag.ConverterOptions('cdr','cdr'))

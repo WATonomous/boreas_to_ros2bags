@@ -13,15 +13,17 @@ Requires Docker. Build the standalone image once:
 git clone https://github.com/WATonomous/boreas_to_ros2bags.git
 cd boreas_to_ros2bags
 docker build -t boreas_to_ros2bag:jazzy .
-
-# Change these to your data and output directories (absolute paths).
-export BOREAS_DATA_ROOT="$HOME/datasets/boreas"
-export BOREAS_BAG_ROOT="$HOME/rosbags/boreas"
-export SEQUENCE=boreas-2020-11-26-13-58
+cp boreas-config.example.sh boreas-config.local.sh
 ```
 
+Edit `boreas-config.local.sh` once to save your data directory, bag directory,
+sequence folder name, and Docker image. `run.sh` loads it automatically on
+the host in every terminal; no exports or container shell are needed. The local
+file is ignored by Git and Docker builds. The template lets existing environment
+values override its defaults.
+
 Already have a sequence? Set `BOREAS_DATA_ROOT` to its **parent directory**
-and `SEQUENCE` to its folder name, then skip the download.
+and `BOREAS_SEQUENCE` to its folder name, then skip the download.
 
 ## 2. Download a sequence
 
@@ -30,9 +32,11 @@ Install the [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-s
 then download only the files needed for LiDAR, IMU, and optional GNSS:
 
 ```bash
+# Load the saved settings for these host-side AWS commands.
+source ./boreas-config.local.sh
 mkdir -p "$BOREAS_DATA_ROOT"
 aws s3 ls s3://boreas/ --no-sign-request
-aws s3 sync "s3://boreas/$SEQUENCE" "$BOREAS_DATA_ROOT/$SEQUENCE" \
+aws s3 sync "s3://boreas/$BOREAS_SEQUENCE" "$BOREAS_DATA_ROOT/$BOREAS_SEQUENCE" \
   --no-sign-request --exclude '*' \
   --include 'calib/*' --include 'applanix/*.csv' --include 'lidar/*'
 ```
@@ -53,10 +57,13 @@ Export a 60-second LiDAR + IMU window into a **new output directory**:
 
 ```bash
 ./run.sh -m boreas_to_ros2bag.convert \
-  --input "$BOREAS_DATA_ROOT/$SEQUENCE" \
-  --output "$BOREAS_BAG_ROOT/sample60" \
+  --output sample60 \
   --sensors lidar imu --start 0 --duration 60
 ```
+
+The input defaults to the saved data root and sequence; `sample60` is created
+under the saved bag root. To convert a different sequence for one run, pass
+`--input /absolute/path/to/sequence`. An absolute `--output` path also works.
 
 Omit `--duration` to export all remaining data. For a later window, use e.g.
 `--start 120 --duration 30`. To include GNSS, use `--sensors lidar imu gnss`;
@@ -72,8 +79,8 @@ IMU. Changing `--sensors` can change the time-window origin.
 
 | Argument | Default | Meaning |
 | --- | --- | --- |
-| `--input PATH` | Required | One sequence directory, not the dataset root. |
-| `--output PATH` | Required | New bag directory, outside the source sequence; existing paths are refused. |
+| `--input PATH` | Configured root/sequence; otherwise required | One sequence directory, not the dataset root. Overrides the saved sequence. |
+| `--output PATH` | Required | New bag name under the configured bag root, or an absolute path outside the source sequence. Existing paths are refused. |
 | `--sensors SENSOR ...` | `lidar imu` | Any combination of `lidar`, `imu`, `camera`, `gnss`. GNSS is post-processed ground truth. |
 | `--start SECONDS` | `0` | Nonnegative offset from the earliest selected sensor timestamp. Decimal seconds accepted. |
 | `--duration SECONDS` | All remaining | Positive window length in seconds. Decimal seconds accepted. |
@@ -90,14 +97,18 @@ Camera also needs `T_camera_lidar.txt` and `P_camera.txt` in `calib/`.
 
 ### Directories and runtime
 
-`run.sh` mounts `BOREAS_DATA_ROOT` read-only and `BOREAS_BAG_ROOT` writable at
+`run.sh` reads `boreas-config.local.sh` next to the script, then mounts
+`BOREAS_DATA_ROOT` read-only and `BOREAS_BAG_ROOT` writable at
 **the same absolute paths** inside the container. All input/output/extrinsic
-paths must be within those mounts. Without the exports above, defaults are
+paths must be within those mounts. Without a config or environment settings, defaults are
 this repo's `data/` and `bags/`; the output root is created automatically.
 `BOREAS_IMAGE` overrides the default image `boreas_to_ros2bag:jazzy`.
+`BOREAS_SEQUENCE` supplies the input folder name when `--input` is omitted.
 
 For native Jazzy, install the [Dockerfile dependencies](Dockerfile), source
-`/opt/ros/jazzy/setup.bash`, and replace `./run.sh` with `python3`.
+`/opt/ros/jazzy/setup.bash`, and replace `./run.sh` with `python3`. Native Python
+does not load the shell config; pass explicit input/output paths or export the
+settings into its environment.
 
 ## 4. Validate and play
 
@@ -106,7 +117,7 @@ IMU, and GNSS values with the source files:
 
 ```bash
 ./run.sh -m boreas_to_ros2bag.validate \
-  "$BOREAS_BAG_ROOT/sample60" --compare-source
+  sample60 --compare-source
 ```
 
 Validator arguments: bag directory, optional `--compare-source` (requires the
@@ -117,6 +128,7 @@ layout/counts/calibration, not source pixels. Reports are saved as
 On a ROS 2 system with the MCAP plugin installed:
 
 ```bash
+source ./boreas-config.local.sh
 ros2 bag info "$BOREAS_BAG_ROOT/sample60"
 ros2 bag play "$BOREAS_BAG_ROOT/sample60" --clock --rate 0.5 \
   --qos-profile-overrides-path config/playback_qos.yaml

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -112,3 +113,22 @@ class ConversionTest(unittest.TestCase):
                                            '/boreas/lidar/points': 1})
         self.assertFalse(report['ground_truth_used'])
         self.assertIsNone(report['gnss'])
+
+    def test_saved_sequence_and_relative_output_and_validation(self):
+        output_root = self.root/'outputs'
+        with patch.dict(os.environ, {'BOREAS_DATA_ROOT': str(self.root),
+                                     'BOREAS_SEQUENCE': self.sequence.name,
+                                     'BOREAS_BAG_ROOT': str(output_root)}):
+            args = make_parser().parse_args(['--output', 'configured', '--no-orientation'])
+            with contextlib.redirect_stdout(io.StringIO()):
+                report = convert(args)
+                result = validate(Path('configured'), compare_source=True)
+        self.assertEqual(report['input'], str(self.sequence))
+        self.assertEqual(report['output'], str(output_root/'configured'))
+        self.assertTrue(result['verified'])
+
+    def test_explicit_input_overrides_saved_sequence(self):
+        with patch.dict(os.environ, {'BOREAS_DATA_ROOT': str(self.root),
+                                     'BOREAS_SEQUENCE': 'a-different-sequence'}):
+            report, _ = self.round_trip('--no-orientation')
+        self.assertEqual(report['input'], str(self.sequence))
