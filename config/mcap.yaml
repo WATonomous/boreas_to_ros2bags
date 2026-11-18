@@ -1,0 +1,6 @@
+# MCAP chunk compression keeps files directly readable by ROS 2 and Foxglove.
+compression: "Zstd"
+compressionLevel: "Fast"
+chunkSize: 4194304
+noChunkCRC: false
+noSummary: false

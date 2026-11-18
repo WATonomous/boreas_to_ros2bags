@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+*.mcap
+*.db3
+*.bag
+bags/

@@ -1,0 +1,285 @@
+# Standalone Boreas SLAM: raw IMU + lidar, no GPS or relocalization plugins.
+# Initial tilt comes from /boreas/imu/data, independently estimated from raw data.
+# EKF acceleration is disabled: Eidos currently subtracts downward gravity, while
+# ROS raw IMU reports upward stationary specific force. See docs/DATA.md.
+/**/eidos_node:
+  ros__parameters:
+    frames:
+      base_link: boreas_base
+      odometry: odom
+      map: map
+    slam_rate: 10.0
+    relocalization_timeout: 30.0
+    isam2:
+      update_iterations: 2
+      correction_iterations: 5
+      loop_closure_iterations: 5
+      relinearize_threshold: 0.01
+      relinearize_skip: 1
+    prior:
+      pose_cov:
+      - 0.01
+      - 0.01
+      - 0.01
+      - 0.01
+      - 0.01
+      - 0.01
+    map:
+      load_path: ''
+      save_path: /opt/watonomous/maps/boreas.map
+    topics:
+      pose: slam/pose
+      status: slam/status
+      odom: slam/odometry
+      odom_pose_cov:
+      - 0.001
+      - 0.001
+      - 0.001
+      - 0.0001
+      - 0.0001
+      - 0.0001
+      save_map_service: slam/save_map
+      load_map_service: slam/load_map
+    factor_plugins:
+    - liso_factor
+    # Omit this list: Eidos defaults to no relocalization plugins.
+    # Jazzy C++ rejects an explicitly empty YAML sequence.
+    visualization_plugins:
+    - keyframe_map_visualization
+    - factor_graph_visualization
+    liso_factor:
+      plugin: eidos::LisoFactor
+      add_factors: true
+      submap_source: recent_keyframes
+      lidar_topic: /boreas/lidar/points
+      odom_topic: liso/odometry
+      odometry_incremental_topic: liso/odometry_incremental
+      imu_topic: /boreas/imu/data
+      lidar_frame: boreas_lidar
+      imu_frame: boreas_imu_raw
+      initialization:
+        warmup_samples: 200
+        stationary_gyr_threshold: 0.02
+      scan_ds_resolution: 0.5
+      submap_ds_resolution: 0.5
+      num_neighbors: 10
+      submap_radius: 20.0
+      max_submap_states: 10
+      max_correspondence_distance: 2.0
+      max_iterations: 20
+      num_threads: 4
+      min_inliers: 50
+      min_noise: 0.01
+      min_scan_distance: 1.0
+      odom_pose_cov:
+      - 0.01
+      - 0.01
+      - 0.005
+      - 1.0e-06
+      - 1.0e-06
+      - 0.001
+      odom_twist_cov:
+      - 0.0001
+      - 0.0001
+      - 1.0e-08
+      - 1.0e-10
+      - 1.0e-10
+      - 1.0e-06
+    keyframe_map_visualization:
+      plugin: eidos::KeyframeMapVisualization
+      topic: slam/visualization/map
+      pointcloud_from: liso_factor/cloud
+      voxel_leaf_size: 0.4
+      publish_rate: 1.0
+      mode: accumulate
+      accumulate:
+        skip_factor: 1
+      windowed:
+        radius: 50.0
+    factor_graph_visualization:
+      plugin: eidos::FactorGraphVisualization
+      topic: slam/visualization/factor_graph
+      state_scale: 1.0
+      line_width: 0.5
+      publish_rate: 1.0
+      mode: full
+      window_radius: 50.0
+/**/eidos_transform_node:
+  ros__parameters:
+    tick_rate: 200.0
+    history_window: 5.0
+    frames:
+      odom: odom
+      base_link: boreas_base
+      map: map
+      utm: utm
+    topics:
+      odom: transform/odometry
+      utm_to_map: /boreas/unused_utm_to_map
+      predict_service: transform/predict_relative
+    ekf:
+      plugin: eidos_transform::HolonomicEKF
+      name: holonomic_ekf
+    holonomic_ekf:
+      process_noise:
+      - 0.0001
+      - 0.0001
+      - 0.0001
+      - 0.0001
+      - 0.0001
+      - 0.0001
+      - 0.01
+      - 0.01
+      - 0.01
+      - 0.01
+      - 0.01
+      - 0.01
+      - 1.0e-06
+      - 1.0e-06
+      - 1.0e-06
+    holonomic_ekf_global:
+      process_noise:
+      - 0.001
+      - 0.001
+      - 0.001
+      - 0.001
+      - 0.001
+      - 0.001
+      - 0.1
+      - 0.1
+      - 0.1
+      - 0.1
+      - 0.1
+      - 0.1
+      - 1.0e-06
+      - 1.0e-06
+      - 1.0e-06
+    odom_sources:
+    - liso_odom
+    - boreas_imu
+    liso_odom:
+      type: odom
+      topic: liso/odometry_incremental
+      pose_mask:
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      twist_mask:
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      pose_noise:
+      - 0.001
+      - 0.001
+      - 0.001
+      - 0.001
+      - 0.001
+      - 0.001
+      twist_noise:
+      - 0.05
+      - 0.05
+      - 0.05
+      - 0.1
+      - 0.03
+      - 0.03
+    map_sources:
+    - liso_map
+    - slam
+    liso_map:
+      type: odom
+      topic: liso/odometry
+      pose_mask:
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      twist_mask:
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      pose_noise:
+      - 0.001
+      - 0.001
+      - 0.001
+      - 0.001
+      - 0.001
+      - 0.001
+      twist_noise:
+      - 0.001
+      - 0.001
+      - 0.001
+      - 0.001
+      - 0.001
+      - 0.001
+    slam:
+      type: odom
+      topic: slam/odometry
+      pose_mask:
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      twist_mask:
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      pose_noise:
+      - 0.0001
+      - 0.0001
+      - 0.0001
+      - 0.0001
+      - 0.0001
+      - 0.0001
+      twist_noise:
+      - 0.01
+      - 0.01
+      - 0.01
+      - 0.01
+      - 0.01
+      - 0.01
+    boreas_imu:
+      type: imu
+      topic: /boreas/imu/data
+      imu_frame: boreas_imu_raw
+      use_orientation: false
+      use_angular_velocity: true
+      use_linear_acceleration: false
+      gravity: 9.803
+      gravity_compensated: false
+      orientation_noise:
+      - 0.01
+      - 0.01
+      - 0.01
+      - 1.0
+      - 1.0
+      - 1.0
+      angular_velocity_noise:
+      - 0.001
+      - 0.001
+      - 0.001
+      - 1.0
+      - 1.0
+      - 1.0
+      linear_velocity_noise:
+      - 1.0
+      - 1.0
+      - 1.0
+      - 0.1
+      - 0.1
+      - 0.1
