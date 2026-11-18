@@ -4,7 +4,7 @@ from tempfile import TemporaryDirectory
 
 import numpy as np
 
-from boreas_to_ros2bag.data import (NS, Orientation, R_BASE_RAW, lidar_points,
+from boreas_to_ros2bag.data import (NS, Orientation, R_BASE_RAW, gnss_rows, lidar_points,
                                    matrix_quaternion, qmatrix, seconds_ns)
 
 
@@ -51,6 +51,38 @@ class ConventionsTest(unittest.TestCase):
             path.write_bytes(b'bad')
             with self.assertRaises(ValueError):
                 lidar_points(path)
+
+
+class GnssTest(unittest.TestCase):
+    def read_rows(self, text):
+        with TemporaryDirectory() as directory:
+            sequence = Path(directory)
+            (sequence / 'applanix').mkdir()
+            (sequence / 'applanix/gps_post_process.csv').write_text(text)
+            return list(gnss_rows(sequence))
+
+    def test_postprocessed_radians_and_exact_timestamp(self):
+        rows = self.read_rows('GPSTime,latitude,longitude,easting,northing,altitude\n'
+                              '1606417077.5213022,0.7641426285531766,-1.3869452891985545,0,0,0\n')
+        self.assertEqual(rows[0][0], 1606417077521302200)
+        self.assertAlmostEqual(rows[0][1], 43.78214756, places=7)
+        self.assertAlmostEqual(rows[0][2], -79.46611149, places=7)
+        self.assertAlmostEqual(rows[0][3], 153.67129211034626, places=7)
+
+    def test_rejects_bad_coordinates_and_missing_columns(self):
+        for latitude, longitude in [('nan', '0'), ('inf', '0'), ('2', '0'), ('0', '4')]:
+            with self.subTest(latitude=latitude, longitude=longitude), self.assertRaises(ValueError):
+                self.read_rows(f'GPSTime,latitude,longitude,easting,northing,altitude\n'
+                               f'1,{latitude},{longitude},0,0,0\n')
+        with self.assertRaisesRegex(ValueError, 'requires'):
+            self.read_rows('GPSTime,easting,northing\n1,0,0\n')
+
+    def test_rejects_duplicate_and_reversed_timestamps(self):
+        for second in ['1', '0.5']:
+            with self.subTest(second=second), self.assertRaisesRegex(ValueError, 'increase strictly'):
+                self.read_rows('GPSTime,latitude,longitude,easting,northing,altitude\n'
+                               f'1,0.7641426285531766,-1.3869452891985545,0,0,0\n'
+                               f'{second},0.7641426285531766,-1.3869452891985545,0,0,0\n')
 
 
 if __name__ == '__main__':

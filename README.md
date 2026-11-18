@@ -1,187 +1,160 @@
-# boreas_to_ros2bag
+# Boreas to ROS 2 bag
 
-Convert an original Boreas sequence into a **ROS 2 Jazzy MCAP/CDR bag** with
-`metadata.yaml`, standard ROS messages, preserved acquisition timestamps and
-static calibration TF. Uses the native writer approach from WATonomous's
-nuScenes converter; [the source comparison and reuse decision](docs/RESEARCH.md)
-explain why its nuScenes reader and other Boreas converters were not forked.
+Convert an **original [Boreas](https://www.boreas.utias.utoronto.ca/) sequence**
+into a ROS 2 Jazzy bag: MCAP files, standard ROS messages, original timestamps,
+static calibration TF, and `metadata.yaml`. Select LiDAR, IMU, camera, and
+optional post-processed GNSS. Radar and Boreas-RT are not supported.
 
-The repository is `/home/watonomous/jsteph/boreas_to_ros2bag`, separate from
-`wato_monorepo`. Raw data is read only; generated bags live on `/mnt/data`.
+## 1. Set up
 
-## Convert and inspect
-
-The existing world-modeling image already has Jazzy, NumPy and the MCAP plugin.
-`run.sh` uses a disposable, network-disabled container; it does not start, stop
-or rebuild any watod service. No pip installation is needed. On the host:
+Requires Docker. Build the standalone image once:
 
 ```bash
-cd /home/watonomous/jsteph/boreas_to_ros2bag
-./run.sh -m unittest discover -s tests -v
-./run.sh -m boreas_to_ros2bag.convert \
-  --input /mnt/data/boreas/boreas-2020-11-26-13-58 \
-  --output /mnt/data/boreas/bags/boreas_sample45 \
-  --sensors lidar imu --duration 45
-./run.sh -m boreas_to_ros2bag.validate \
-  /mnt/data/boreas/bags/boreas_sample45 --compare-source
-```
-
-**The sample above already exists.** The converter refuses overwrites; choose a
-new output directory to repeat conversion. `--start` and `--duration` are seconds
-from the earliest selected sensor timestamp, with a half-open interval. The raw
-IMU begins about 20 seconds before the first LiDAR scan, so this sample has
-20 seconds of IMU initialization followed by about 25 seconds of LiDAR, including
-vehicle motion. Later windows still integrate the preceding raw IMU samples,
-but Eidos itself should start on a stationary window for LISO warmup.
-
-Native `ros2 bag info` without starting the stopped watod container:
-
-```bash
-docker run --rm --network none --entrypoint bash \
-  -v /mnt/data/boreas/bags:/bags:ro \
-  ghcr.io/watonomous/wato_monorepo/world_modeling/world_modeling:dep_eidos-tro \
-  -c 'source /opt/ros/jazzy/setup.bash; ros2 bag info /bags/boreas_sample45'
-```
-
-For a different data root, set `BOREAS_DATA_ROOT` and `BOREAS_BAG_ROOT` before
-`run.sh`; paths in `--input`/`--output` must be within those mounted directories.
-The converter keeps one cloud/image per active stream plus filename indexes,
-a two-second IMU seed, and a 4 MiB MCAP chunk in memory. It never loads the
-sequence's clouds or CSV in full. Files split at approximately 4 GiB; all splits
-share bag metadata. MCAP uses Zstd chunk compression, not whole-file compression.
-`conversion.json` records selection, counts, bias estimate and frame assumptions.
-`validation.json` records readback checks. A failed/interrupted run can leave a
-partial directory; use a new output path and inspect it before retaining it.
-
-## Eidos playback
-
-At inspection, `watod_watonomous-world_modeling_bringup_dev-1` was **exited**.
-It was left untouched. Its current `/ws/bags` bind points at Lucas's bag path,
-not `/mnt/data`. At your next planned container start, set this line in
-`/home/watonomous/jsteph/wato_monorepo/watod-config.local.sh`:
-
-```bash
-export BAG_DIRECTORY="/mnt/data/boreas/bags"
-```
-
-Then run the following on the host **when ready to recreate/start that service**;
-changing a bind mount requires recreation. Rebuild Eidos yourself if needed.
-The new configuration is copied as a small file, without changing existing
-Ring Road configs or requiring a config-only rebuild:
-
-```bash
-cd /home/watonomous/jsteph/wato_monorepo
-./watod up -d
-docker cp /home/watonomous/jsteph/boreas_to_ros2bag/config/eidos_boreas_slam.yaml \
-  watod_watonomous-world_modeling_bringup_dev-1:/tmp/eidos_boreas_slam.yaml
-docker cp /home/watonomous/jsteph/boreas_to_ros2bag/config/playback_qos.yaml \
-  watod_watonomous-world_modeling_bringup_dev-1:/tmp/boreas_playback_qos.yaml
-./watod exec world_modeling_bringup_dev bash
-```
-
-In container terminal 1:
-
-```bash
-source /ws/install/setup.bash
-ros2 launch eidos_transform eidos_transform.launch.yaml \
-  config_file:=/tmp/eidos_boreas_slam.yaml use_sim_time:=true
-```
-
-In container terminal 2 (enter with `./watod exec world_modeling_bringup_dev bash`):
-
-```bash
-source /ws/install/setup.bash
-ros2 launch eidos eidos.launch.yaml \
-  eidos_config_file:=/tmp/eidos_boreas_slam.yaml use_sim_time:=true
-```
-
-In container terminal 3, start from the beginning after both nodes are active:
-
-```bash
-source /ws/install/setup.bash
-ros2 bag info /ws/bags/boreas_sample45
-ros2 bag play /ws/bags/boreas_sample45 --clock --rate 0.5 \
-  --qos-profile-overrides-path /tmp/boreas_playback_qos.yaml \
-  --topics /boreas/lidar/points /boreas/imu/data /tf_static
-```
-
-The bag already records the correct static QoS; this override makes the playback
-choice explicit. Let the player generate `/clock`. Topics and frames are Boreas
-specific; the supplied Eidos config refers to them directly without pretending
-to be Novatel or Ring Road. It enables LISO only, no GPS factor or GPS
-relocalization plugins, and supplies the orientation LISO needs for initialization.
-It fuses LiDAR odometry and IMU gyro in the transform EKF; acceleration and EKF
-orientation fusion are disabled. See [IMU signs and calibration assumptions](docs/DATA.md).
-
-Check `IMU warmup complete`, `TRACKING` and increasing keyframes:
-
-```bash
-ros2 topic echo /world_modeling/slam/status
-ros2 run tf2_ros tf2_echo boreas_base boreas_lidar
-```
-
-In Foxglove use fixed frame `map`, cloud `/boreas/lidar/points`, map
-`/world_modeling/slam/visualization/map`, odometry
-`/world_modeling/transform/odometry` and `/tf`. A map can be saved explicitly:
-
-```bash
-ros2 service call /world_modeling/slam/save_map eidos_msgs/srv/SaveMap \
-  "{filepath: '/opt/watonomous/maps/boreas.map'}"
-```
-
-This is a SLAM baseline. GPS-assisted localization is deliberately absent;
-localizing a saved map requires an appropriate non-GPS initial-pose/relocalization
-strategy, not a fabricated GPS fix or a ground-truth seed.
-
-## Full sequence and optional camera
-
-After the validated sample, convert all downloaded LiDAR and IMU measurements:
-
-```bash
-cd /home/watonomous/jsteph/boreas_to_ros2bag
-./run.sh -m boreas_to_ros2bag.convert \
-  --input /mnt/data/boreas/boreas-2020-11-26-13-58 \
-  --output /mnt/data/boreas/bags/boreas-2020-11-26-13-58-lidar-imu \
-  --sensors lidar imu
-```
-
-The full LiDAR/IMU bag above **already exists and has passed source comparison**.
-It contains 9,984 scans, 215,097 raw IMU messages, 215,097 IMU messages with
-estimated orientation and one static TF message: 440,179 records over
-1,075.4793698 seconds. Native Jazzy `ros2 bag info` reports 32.4 GiB across nine
-MCAP files. `validation.json` in the bag directory records successful CDR/schema,
-timestamp, TF/QoS and complete source-data checks. Camera is not included.
-Choose a new output path to repeat conversion; the existing bag is never overwritten.
-Eidos playback testing is still pending.
-
-For a portable Jazzy environment or camera decoding, build the converter image
-(separate from Eidos). This installs ROS bag packages, NumPy and Pillow:
-
-```bash
-cd /home/watonomous/jsteph/boreas_to_ros2bag
+git clone https://github.com/WATonomous/boreas_to_ros2bags.git
+cd boreas_to_ros2bags
 docker build -t boreas_to_ros2bag:jazzy .
-BOREAS_IMAGE=boreas_to_ros2bag:jazzy ./run.sh -m boreas_to_ros2bag.convert \
-  --input /mnt/data/boreas/boreas-2020-11-26-13-58 \
-  --output /mnt/data/boreas/bags/boreas_camera_sample \
-  --sensors lidar imu camera --duration 22
+
+# Change these to your data and output directories (absolute paths).
+export BOREAS_DATA_ROOT="$HOME/datasets/boreas"
+export BOREAS_BAG_ROOT="$HOME/rosbags/boreas"
+export SEQUENCE=boreas-2020-11-26-13-58
 ```
 
-Camera output is decoded `sensor_msgs/msg/Image` (`rgb8`) plus rectified
-`CameraInfo` and optical-frame TF. It is optional and increases bag size.
-For native Jazzy installations, source `/opt/ros/jazzy/setup.bash`, install the
-packages listed in `Dockerfile`, and run `python3 -m boreas_to_ros2bag.convert`
-from the repo instead of `run.sh`.
+Already have a sequence? Set `BOREAS_DATA_ROOT` to its **parent directory**
+and `SEQUENCE` to its folder name, then skip the download.
 
-## Verified boundary
+## 2. Download a sequence
 
-The initial 45-second bag is 759.3 MiB with 18,245 messages: 242 PointCloud2,
-9,001 raw Imu, 9,001 Imu with estimated orientation, one TFMessage. Six unit
-tests pass on Jazzy. Native readback checks every CDR message, counts, timestamps,
-embedded ROS schemas, TF tree/QoS, and compares every cloud field and raw IMU
-value against source. An independent `rosbags` reader agrees on counts and order.
-See [sample verification](docs/SAMPLE.md).
+Choose a sequence from the [Boreas dataset](https://www.boreas.utias.utoronto.ca/).
+Install the [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html),
+then download only the files needed for LiDAR, IMU, and optional GNSS:
 
-Optional camera decoding, dimensions, calibration and standard-message CDR round
-trips were checked on the host's Humble/Pillow environment. A Jazzy camera bag
-and the portable Dockerfile build have not been tested. **Eidos rebuild, playback,
-tracking quality and Foxglove display remain for your runtime testing.**
+```bash
+mkdir -p "$BOREAS_DATA_ROOT"
+aws s3 ls s3://boreas/ --no-sign-request
+aws s3 sync "s3://boreas/$SEQUENCE" "$BOREAS_DATA_ROOT/$SEQUENCE" \
+  --no-sign-request --exclude '*' \
+  --include 'calib/*' --include 'applanix/*.csv' --include 'lidar/*'
+```
+
+No AWS account is required. For camera, append `--include 'camera/*'`.
+For reported GNSS uncertainty, also append `--include 'applanix/sbet.out'`
+and `--include 'applanix/smrmsg.out'`.
+Re-running sync downloads missing files; selecting CSVs avoids large raw logs. See the
+[official download guide](https://github.com/utiasASRL/pyboreas#download-instructions)
+and [data reference](https://github.com/utiasASRL/pyboreas/blob/master/DATA_REFERENCE.md).
+PyBoreas is not required. Keep `calib/` for every selection. IMU needs
+`applanix/imu_raw.csv`; GNSS needs `applanix/gps_post_process.csv` (not available
+in every test sequence). LiDAR and camera need their respective sensor folders.
+
+## 3. Convert
+
+Export a 60-second LiDAR + IMU window into a **new output directory**:
+
+```bash
+./run.sh -m boreas_to_ros2bag.convert \
+  --input "$BOREAS_DATA_ROOT/$SEQUENCE" \
+  --output "$BOREAS_BAG_ROOT/sample60" \
+  --sensors lidar imu --start 0 --duration 60
+```
+
+Omit `--duration` to export all remaining data. For a later window, use e.g.
+`--start 120 --duration 30`. To include GNSS, use `--sensors lidar imu gnss`;
+to include everything supported, use `--sensors lidar imu camera gnss`.
+Each sensor can also be selected alone.
+
+**Time windows begin at the earliest timestamp among the selected sensors.**
+`--start 120 --duration 30` exports `[first + 120 s, first + 150 s)`.
+Sensors can start at different times; the first part of a bag may contain only
+IMU. Changing `--sensors` can change the time-window origin.
+
+### Converter arguments
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `--input PATH` | Required | One sequence directory, not the dataset root. |
+| `--output PATH` | Required | New bag directory, outside the source sequence; existing paths are refused. |
+| `--sensors SENSOR ...` | `lidar imu` | Any combination of `lidar`, `imu`, `camera`, `gnss`. GNSS is post-processed ground truth. |
+| `--start SECONDS` | `0` | Nonnegative offset from the earliest selected sensor timestamp. Decimal seconds accepted. |
+| `--duration SECONDS` | All remaining | Positive window length in seconds. Decimal seconds accepted. |
+| `--no-orientation` | Off | Write raw IMU only; skip orientation initialization and the estimated-orientation topic. |
+| `--seed-seconds SECONDS` | `2` | Initial stationary IMU interval for tilt/bias estimation; greater than 0, at most 30. |
+| `--stationary-gyro RAD_S` | `0.02` | Positive maximum gyro norm allowed during initialization. |
+| `--raw-extrinsic PATH` | Axes-only transform | Measured 4×4 `T_applanix_raw_imu` text matrix; must be accessible inside the mounted directories. |
+| `--max-bag-gib GIB` | `4` | Approximate MCAP split size in GiB; minimum `0.01`. Splits share bag metadata. |
+| `--gnss-status {fix,unknown}` | `fix` | Mark validated post-processed positions valid (`0`), or leave status unknown (`-2`). This is an export convention, not recovered receiver quality. |
+| `-h`, `--help` | — | Show command help. |
+
+Orientation options apply to IMU; `--no-orientation` disables seeding.
+Camera also needs `T_camera_lidar.txt` and `P_camera.txt` in `calib/`.
+
+### Directories and runtime
+
+`run.sh` mounts `BOREAS_DATA_ROOT` read-only and `BOREAS_BAG_ROOT` writable at
+**the same absolute paths** inside the container. All input/output/extrinsic
+paths must be within those mounts. Without the exports above, defaults are
+this repo's `data/` and `bags/`; the output root is created automatically.
+`BOREAS_IMAGE` overrides the default image `boreas_to_ros2bag:jazzy`.
+
+For native Jazzy, install the [Dockerfile dependencies](Dockerfile), source
+`/opt/ros/jazzy/setup.bash`, and replace `./run.sh` with `python3`.
+
+## 4. Validate and play
+
+Read every message back, check schemas/timestamps/TF, and compare LiDAR, raw
+IMU, and GNSS values with the source files:
+
+```bash
+./run.sh -m boreas_to_ros2bag.validate \
+  "$BOREAS_BAG_ROOT/sample60" --compare-source
+```
+
+Validator arguments: bag directory, optional `--compare-source` (requires the
+original input at its recorded path), and `-h`/`--help`. Camera checks cover
+layout/counts/calibration, not source pixels. Reports are saved as
+`conversion.json` and `validation.json` inside the bag directory.
+
+On a ROS 2 system with the MCAP plugin installed:
+
+```bash
+ros2 bag info "$BOREAS_BAG_ROOT/sample60"
+ros2 bag play "$BOREAS_BAG_ROOT/sample60" --clock --rate 0.5 \
+  --qos-profile-overrides-path config/playback_qos.yaml
+```
+
+Set consuming nodes to `use_sim_time:=true`. Playback generates `/clock`.
+
+### Output topics
+
+| Selection | Topic | ROS message |
+| --- | --- | --- |
+| `lidar` | `/boreas/lidar/points` | `sensor_msgs/msg/PointCloud2` |
+| `imu` | `/boreas/imu/data_raw` | `sensor_msgs/msg/Imu` |
+| `imu` without `--no-orientation` | `/boreas/imu/data` | `sensor_msgs/msg/Imu` with estimated orientation |
+| `camera` | `/boreas/camera/image_rect` | `sensor_msgs/msg/Image` (`rgb8`) |
+| `camera` | `/boreas/camera/camera_info` | `sensor_msgs/msg/CameraInfo` |
+| `gnss` | `/boreas/gnss/postprocessed/fix` | `sensor_msgs/msg/NavSatFix` |
+| Always | `/tf_static` | `tf2_msgs/msg/TFMessage` |
+
+## Important gotchas
+
+- **GNSS is fused ground truth.** Avoid using it as independent GNSS in Boreas
+  benchmarks. Coordinates become degrees; ellipsoid height is reconstructed
+  from the published ENU origin. Status `0` means a valid exported position;
+  satellite service remains unknown. Covariance uses aligned SMRMSG errors
+  when both auxiliary files exist; otherwise it stays unknown. Clock/position
+  mismatches fail conversion. [Source details](docs/BOREAS.md#ellipsoid-height-and-uncertainty).
+- **IMU orientation needs a stationary start.** The initial two seconds seed
+  tilt/bias; yaw is arbitrary and drifts. Later windows integrate preceding
+  samples. Use `--no-orientation` if seeding fails. Processed `imu.csv` has
+  gravity removed and is not used as raw IMU.
+- **Frames and timing matter.** Epoch timestamps stay unchanged. LiDAR `time`
+  is signed seconds from scan center; `ring` is UINT16. Raw IMU axes are
+  backward/left/down; its default origin is assumed co-located with Applanix.
+  Supply a measured `--raw-extrinsic` when needed. [Frame details](docs/DATA.md).
+- **Keep the whole output directory.** MCAP chunks use Zstd, but decoded camera
+  data can be large. Keep all splits and `metadata.yaml`. Interrupted runs may
+  leave partial bags; inspect them and use a new output path to retry.
+
+[Verified dataset notes and sources](docs/BOREAS.md) ·
+[Detailed data conventions](docs/DATA.md)

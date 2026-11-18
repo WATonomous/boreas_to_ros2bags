@@ -5,3 +5,4 @@ __pycache__/
 *.db3
 *.bag
 bags/
+data/

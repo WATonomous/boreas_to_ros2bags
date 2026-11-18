@@ -3,3 +3,4 @@ __pycache__
 *.mcap
 *.db3
 bags
+data

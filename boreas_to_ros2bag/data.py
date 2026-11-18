@@ -1,4 +1,4 @@
-"""Dataset conventions, independent of ROS and post-processed pose files."""
+"""Dataset conventions and streaming readers, independent of ROS."""
 
 import csv
 from decimal import Decimal
@@ -7,6 +7,30 @@ from pathlib import Path
 import numpy as np
 
 NS = 1_000_000_000
+# Shared origin published by the Boreas maintainers, radians/radians/metres.
+BOREAS_ORIGIN = (0.7641426285531766, -1.3869452891985545, 153.67129211034626)
+WGS84_A = 6378137.
+WGS84_E2 = 1 - (1 - 1/298.257223563)**2
+
+
+def geodetic_surface(latitude, longitude):
+    n = WGS84_A / np.sqrt(1 - WGS84_E2*np.sin(latitude)**2)
+    return np.array([n*np.cos(latitude)*np.cos(longitude),
+                     n*np.cos(latitude)*np.sin(longitude), n*(1-WGS84_E2)*np.sin(latitude)])
+
+
+def geodetic_normal(latitude, longitude):
+    return np.array([np.cos(latitude)*np.cos(longitude),
+                     np.cos(latitude)*np.sin(longitude), np.sin(latitude)])
+
+
+_lat0, _lon0, _height0 = BOREAS_ORIGIN
+ECEF_ORIGIN = geodetic_surface(_lat0, _lon0) + _height0*geodetic_normal(_lat0, _lon0)
+R_ECEF_ENU = np.array([
+    [-np.sin(_lon0), -np.sin(_lat0)*np.cos(_lon0), np.cos(_lat0)*np.cos(_lon0)],
+    [np.cos(_lon0), -np.sin(_lat0)*np.sin(_lon0), np.cos(_lat0)*np.sin(_lon0)],
+    [0., np.cos(_lat0), np.sin(_lat0)],
+])
 R_BASE_APPLANIX = np.array([[0., 1., 0.], [-1., 0., 0.], [0., 0., 1.]])
 R_APPLANIX_RAW = np.array([[0., -1., 0.], [-1., 0., 0.], [0., 0., -1.]])
 R_BASE_RAW = R_BASE_APPLANIX @ R_APPLANIX_RAW
@@ -42,6 +66,116 @@ def imu_rows(sequence):
             if not np.isfinite(gyro).all() or not np.isfinite(accel).all():
                 raise ValueError(f'Nonfinite IMU measurement at {t}')
             yield t, gyro, accel
+
+
+def gnss_rows(sequence):
+    """Read post-processed geodetic positions, not raw receiver fixes.
+
+    Convert radians to degrees and recover ellipsoid height from the shared
+    ENU origin. Check that local and geodetic positions describe the same point.
+    """
+    previous = -1
+    with (sequence / 'applanix/gps_post_process.csv').open() as stream:
+        rows = csv.DictReader(stream)
+        required = {'GPSTime', 'latitude', 'longitude', 'easting', 'northing', 'altitude'}
+        if not required.issubset(rows.fieldnames or []):
+            raise ValueError('gps_post_process.csv requires GPSTime, latitude, longitude, '
+                             'easting, northing, altitude columns')
+        for row in rows:
+            t = seconds_ns(row['GPSTime'])
+            if t <= previous:
+                raise ValueError('GNSS timestamps must increase strictly')
+            previous = t
+            latitude, longitude = float(row['latitude']), float(row['longitude'])
+            if (not np.isfinite([latitude, longitude]).all()
+                    or not -np.pi/2 <= latitude <= np.pi/2
+                    or not -np.pi <= longitude <= np.pi):
+                raise ValueError(f'Invalid GNSS latitude/longitude at {t}; expected radians')
+            enu = np.array([float(row[k]) for k in ('easting', 'northing', 'altitude')])
+            if not np.isfinite(enu).all():
+                raise ValueError(f'Nonfinite GNSS ENU position at {t}')
+            normal = geodetic_normal(latitude, longitude)
+            delta = ECEF_ORIGIN + R_ECEF_ENU @ enu - geodetic_surface(latitude, longitude)
+            height = float(delta @ normal)
+            if np.linalg.norm(delta - height*normal) > 0.01:
+                raise ValueError(f'GNSS ENU/geodetic position mismatch at {t}; '
+                                 'expected the published original Boreas origin')
+            yield t, float(np.degrees(latitude)), float(np.degrees(longitude)), height
+
+
+def utc_week_seconds(timestamp):
+    """Sunday-based UTC week time without rounding a Unix epoch through float."""
+    day = timestamp // (86400*NS)
+    sunday = day - (day+4) % 7  # Unix epoch was a Thursday.
+    return (timestamp - sunday*86400*NS) / NS
+
+
+def binary_records(path, columns):
+    if not path.stat().st_size or path.stat().st_size % (columns*8):
+        raise ValueError(f'{path}: expected complete {columns}-double records')
+    return np.memmap(path, dtype='<f8', mode='r').reshape(-1, columns)
+
+
+class GnssUncertainty:
+    """Use SMRMSG RMS only after verifying the CSV/SBET time correspondence.
+
+    SBET permits different time systems. No leap-second shift is guessed: every
+    CSV position must match a SBET position at the same UTC second of week.
+    """
+
+    def __init__(self, sequence):
+        paths = [sequence/'applanix'/name for name in ('sbet.out', 'smrmsg.out')]
+        self.errors = None
+        self.metadata = {'available': False, 'missing_files': [p.name for p in paths if not p.is_file()]}
+        if self.metadata['missing_files']:
+            return
+        sbet = binary_records(paths[0], 17)
+        errors = binary_records(paths[1], 10)
+        if (len(sbet) < 2 or not np.isfinite(sbet[:, :4]).all()
+                or np.any(np.diff(sbet[:, 0]) <= 0)):
+            raise ValueError('Invalid SBET positions/time alignment reference')
+        if (len(errors) < 2 or not np.isfinite(errors[:, :4]).all()
+                or np.any(errors[:, 1:4] < 0) or np.any(np.diff(errors[:, 0]) <= 0)
+                or np.any(np.diff(errors[:, 0]) > 2)):
+            raise ValueError('Invalid SMRMSG position uncertainty or time spacing')
+        count, previous = 0, -1
+        sbet_times = np.array(sbet[:, 0])
+        max_dt = max_position_error = 0.
+        for timestamp, latitude, longitude, _ in gnss_rows(sequence):
+            tow = utc_week_seconds(timestamp)
+            upper = int(np.searchsorted(sbet_times, tow))
+            choices = [i for i in (upper-1, upper) if 0 <= i < len(sbet)]
+            index = min(choices, key=lambda i: abs(sbet[i, 0]-tow))
+            dt = abs(sbet[index, 0]-tow)
+            if dt > 1e-6 or index <= previous:
+                raise ValueError('GNSS CSV/SBET time alignment failed; refusing to guess a GPS/UTC offset')
+            error = float(np.max(np.abs(sbet[index, 1:3] - np.radians([latitude, longitude]))))
+            if error > 1e-10:
+                raise ValueError('GNSS CSV/SBET position mismatch; cannot align uncertainty')
+            if not errors[0, 0] <= tow <= errors[-1, 0]:
+                raise ValueError('SMRMSG does not cover the GNSS timestamps; refusing extrapolation')
+            previous = index
+            count += 1
+            max_dt, max_position_error = max(max_dt, dt), max(max_position_error, error)
+        if not count:
+            raise ValueError('No GNSS positions to align with SMRMSG')
+        self.errors = errors
+        self.metadata = {
+            'available': True, 'source': 'applanix/smrmsg.out',
+            'alignment_reference': 'applanix/sbet.out', 'matched_csv_samples': count,
+            'time_policy': 'UTC seconds-of-week, checked against every CSV/SBET position; no guessed leap offset',
+            'max_time_residual_s': float(max_dt), 'max_position_residual_rad': max_position_error,
+            'method': 'Linearly interpolate published N/E/D RMS in metres, then square and reorder to ENU',
+            'covariance_type': 'APPROXIMATED; interpolated diagonal only, no published cross terms',
+        }
+
+    def diagonal(self, timestamp):
+        if self.errors is None:
+            return None
+        tow = utc_week_seconds(timestamp)
+        if not self.errors[0, 0] <= tow <= self.errors[-1, 0]:
+            raise ValueError('SMRMSG does not cover GNSS timestamp')
+        return [float(np.interp(tow, self.errors[:, 0], self.errors[:, i]))**2 for i in (2, 1, 3)]
 
 
 def lidar_points(path):

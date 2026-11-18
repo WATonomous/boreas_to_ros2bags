@@ -14,7 +14,7 @@ and time in **seconds relative to the filename timestamp**. The first scan has
 [-0.051758, +0.051758] s. Intensity remains unnormalized float32. Ring becomes
 UINT16 without changing its value. `time` remains signed FLOAT32 seconds relative
 to the middle of the scan. It is not nanoseconds, not a start-of-scan offset,
-and not an absolute epoch. No deskewing is performed; LISO currently ignores ring/time.
+and not an absolute epoch. No deskewing is performed.
 
 Sensor filenames and sensor pose CSV epochs are microseconds UTC since Unix epoch.
 `imu_raw.csv` uses decimal **seconds** despite the `GPSTime` header. The first
@@ -30,8 +30,47 @@ Every record time equals its sensor header time. Independent sensor generators
 are merged by timestamp. A scan is stamped at its temporal middle, so some of
 its points precede the bag record time. `/tf_static` is one aggregate message at
 the first emitted sensor time; it includes every sensor edge and has reliable,
-transient-local durability. No `/clock`, moving vehicle TF, pose, GPS fix, or
-ground-truth message is written. Playback supplies `/clock`; Eidos owns map/odom TF.
+transient-local durability. No `/clock`, moving vehicle TF, or pose is written.
+Playback supplies `/clock`; consuming applications own map/odom TF.
+Post-processed GNSS is exported only when explicitly selected with `--sensors gnss`.
+
+## Optional GNSS
+
+`--sensors gnss` reads `applanix/gps_post_process.csv` and writes
+`sensor_msgs/msg/NavSatFix` on `/boreas/gnss/postprocessed/fix`. The navigation
+solution is post-processed GNSS/INS ground truth, not independent raw GNSS.
+The converter records `ground_truth_used: true` and the source and limitations
+in `conversion.json`. Other sensor selections do not read this file.
+
+Latitude/longitude are converted from radians to degrees. The source coordinates
+use ITRF2000 at the observation epoch on the WGS84 ellipsoid; no realization
+or epoch transformation is performed. Ellipsoid height is reconstructed by
+mapping the CSV's east/north/up position into ECEF using the published shared
+Boreas origin, then projecting onto the geodetic normal at the reported
+latitude/longitude. A residual above 1 cm rejects incompatible coordinates.
+This accounts for Earth curvature; local up is never used directly as altitude.
+
+By default `status=0` (`STATUS_FIX`) is a validity convention for the validated
+exported position, not an observation of the receiver's correction mode.
+`--gnss-status unknown` retains `status=-2`. Neither setting claims RTK, SBAS,
+GBAS, or independent raw GNSS. The service mask remains zero (unknown).
+
+When `applanix/sbet.out` and `applanix/smrmsg.out` are both available, the
+converter verifies every CSV timestamp and latitude/longitude against SBET
+using UTC seconds-of-week. It refuses an inferred GPS/UTC leap-second offset,
+position mismatches, or missing uncertainty coverage. Interpolated SMRMSG
+north/east/down position RMS values are squared and reordered into the ROS
+east/north/up covariance diagonal. Cross terms are unavailable; zeros occupy
+those entries and the covariance type is `APPROXIMATED` (1). Reported solution
+uncertainty does not independently establish centimetre-accurate ground truth.
+If either auxiliary file is missing, covariance stays zero with type `UNKNOWN`
+(0); the absence is recorded in `conversion.json`. Malformed or inconsistent
+auxiliary files fail conversion rather than silently supplying unreliable data.
+
+The header frame is `boreas_applanix`, the navigation reference point, not an
+assumed antenna location. Header and bag timestamps match the exact decimal CSV
+epoch. Missing CSVs or malformed columns, coordinates, and non-increasing
+timestamps fail conversion. See [official sources and format checks](BOREAS.md).
 
 ## IMU and orientation
 
@@ -40,9 +79,10 @@ ground-truth message is written. Playback supplies `/clock`; Eidos owns map/odom
   -9.8 m/s²: specific force points up, as required by ROS IMU semantics.
 - `imu.csv`: **post-processed** Applanix solution, gravity removed. It is not raw
   IMU. It is not used here.
-- `gps_post_process.csv`, `lidar_poses.csv`, `camera_poses.csv`: post-processed
-  ground truth, excluded from all converter estimator paths. Exporting them as
-  GPS or seeding initialization from their poses would leak the reference solution.
+- `gps_post_process.csv`: optional post-processed GNSS export described above.
+  It is never used to initialize IMU orientation. `lidar_poses.csv` and
+  `camera_poses.csv` are not used. Fusing the GNSS export when benchmarking
+  against the same reference solution would leak ground truth.
 
 `/boreas/imu/data_raw` preserves the raw CSV values and has
 `orientation_covariance[0] = -1`. `/boreas/imu/data` preserves the same gyro and
@@ -58,25 +98,11 @@ acceleration and adds an **estimate**, not an Applanix orientation:
 Orientation is marked unavailable until the seed interval ends. The 0.0025 rad²
 tilt variances are approximate; yaw variance is 1e6 rad² because heading is
 unobservable. Orientation drifts with gyro error during motion; it is not a
-general calibrated attitude solution. Eidos uses it for initial tilt only and
-uses raw gyro thereafter. Its EKF has `use_orientation: false`.
-
-LISO requires a valid quaternion **and** consecutive low-gyro samples. Disabling
-EKF orientation alone cannot initialize it. The Boreas config uses 200 samples
-and a 0.02 rad/s threshold to accommodate observed stationary gyro noise.
-The sample has 4,881 consecutive valid stationary orientation samples. If a new
-sequence does not start stationary, conversion fails; `--no-orientation` exports
-raw IMU only and is explicitly unsuitable for the supplied LISO configuration.
-The measured initial gravity is 9.80285 m/s²; the config rounds this to 9.803.
-
-Eidos currently calculates acceleration compensation as `acc_base - g_body`
-with downward `g_world`. ROS raw specific force is upward when stationary.
-Enabling its current compensation on these messages would double gravity.
-The supplied config disables EKF **linear acceleration fusion**, retains
-gyro/LiDAR, and sets `gravity_compensated: false`. This does not alter the raw
-bag values. Enabling acceleration needs an estimator-side sign review and
-raw-IMU lever-arm confirmation; copying Ring Road's already-compensated setting
-would be incorrect.
+general calibrated attitude solution. If a sequence does not start stationary,
+conversion fails; `--no-orientation` exports raw IMU only. Check whether the
+consuming application requires an orientation estimate. Raw acceleration is
+specific force, not gravity-compensated acceleration; preserve that distinction
+when configuring sensor fusion.
 
 ## Calibration and frame tree
 
@@ -113,4 +139,4 @@ of that translation. Do not import the newer Boreas-RT DMU extrinsics.
 
 The validator checks a unique-parent acyclic tree rooted at `boreas_base`, unit
 quaternions, stored transform values and original LiDAR/camera calibration files.
-Physical calibration accuracy and Eidos tracking still require runtime testing.
+Physical calibration accuracy and downstream tracking still require runtime testing.

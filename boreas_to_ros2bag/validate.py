@@ -12,7 +12,7 @@ from rclpy.serialization import deserialize_message
 from rclpy.qos import DurabilityPolicy, ReliabilityPolicy
 from rosidl_runtime_py.utilities import get_message
 
-from .data import NS, POINT_DTYPE, imu_rows, qmatrix, sensor_files
+from .data import NS, POINT_DTYPE, GnssUncertainty, gnss_rows, imu_rows, qmatrix, sensor_files
 
 
 def require(condition, message):
@@ -40,6 +40,14 @@ def validate(path, compare_source=False):
     begin = report['requested_start_ns']
     end = report['requested_end_ns'] or 2**63-1
     source_imu = (row for row in imu_rows(sequence) if begin <= row[0] < end) if compare_source and 'imu' in report['sensors'] else None
+    source_gnss = (row for row in gnss_rows(sequence) if begin <= row[0] < end) if compare_source and 'gnss' in report['sensors'] else None
+    gnss_policy = report.get('gnss') or {}
+    height_available = gnss_policy.get('altitude_method') == 'boreas_enu_to_wgs84'
+    has_uncertainty = gnss_policy.get('uncertainty', {}).get('available', False)
+    source_uncertainty = GnssUncertainty(sequence) if compare_source and has_uncertainty else None
+    if source_uncertainty is not None:
+        require(source_uncertainty.metadata['available'], 'GNSS uncertainty source files are missing')
+    require(report['ground_truth_used'] == ('gnss' in report['sensors']), 'GNSS provenance mismatch')
     counts = Counter()
     first = None
     last = -1
@@ -101,6 +109,33 @@ def validate(path, compare_source=False):
                     longest_stationary = max(longest_stationary, valid_stationary)
                 else:
                     invalid_orientations += 1
+        elif topic == '/boreas/gnss/postprocessed/fix':
+            require(msg.header.frame_id == 'boreas_applanix', 'Wrong GNSS reference frame')
+            require(np.isfinite([msg.latitude, msg.longitude]).all()
+                    and -90 <= msg.latitude <= 90 and -180 <= msg.longitude <= 180, 'Invalid GNSS coordinates')
+            require(np.isfinite(msg.altitude) if height_available else np.isnan(msg.altitude),
+                    'GNSS altitude disagrees with its recorded policy')
+            require(msg.status.status == gnss_policy.get('status_value', -2)
+                    and msg.status.service == 0, 'GNSS status policy mismatch')
+            if has_uncertainty:
+                require(msg.position_covariance_type == msg.COVARIANCE_TYPE_APPROXIMATED
+                        and np.isfinite(msg.position_covariance).all()
+                        and all(msg.position_covariance[i] >= 0 for i in (0, 4, 8))
+                        and all(msg.position_covariance[i] == 0 for i in (1, 2, 3, 5, 6, 7)),
+                        'Invalid interpolated GNSS covariance')
+                if source_uncertainty is not None:
+                    require(np.allclose([msg.position_covariance[i] for i in (0, 4, 8)],
+                                        source_uncertainty.diagonal(timestamp), rtol=1e-12, atol=1e-15),
+                            'GNSS covariance differs from source SMRMSG')
+            else:
+                require(msg.position_covariance_type == msg.COVARIANCE_TYPE_UNKNOWN
+                        and all(x == 0 for x in msg.position_covariance), 'GNSS covariance must be unknown')
+            if source_gnss is not None:
+                t, latitude, longitude, altitude = next(source_gnss)
+                require(t == timestamp and msg.latitude == latitude and msg.longitude == longitude,
+                        'Changed source GNSS coordinates or timestamp')
+                if height_available:
+                    require(abs(msg.altitude-altitude) < 1e-6, 'GNSS ellipsoid height mismatch')
         elif topic.endswith('image_rect'):
             require(msg.encoding == 'rgb8' and len(msg.data) == msg.width*msg.height*3, 'Invalid camera image')
         elif topic.endswith('camera_info'):
@@ -138,6 +173,8 @@ def validate(path, compare_source=False):
                 require(counts[topic] == expected, f'Missing {sensor} files in interval')
         if source_imu is not None:
             require(next(source_imu,None) is None, 'Missing source IMU samples')
+        if source_gnss is not None:
+            require(next(source_gnss,None) is None, 'Missing source GNSS samples')
     reader.close()
     result = {'verified': True, 'source_compared': compare_source, 'counts': dict(counts),
               'first_ns':first,'last_ns':last,'duration_s':(last-first)/NS,

@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-image="${BOREAS_IMAGE:-ghcr.io/watonomous/wato_monorepo/world_modeling/world_modeling:dep_eidos-tro}"
-data_root="${BOREAS_DATA_ROOT:-/mnt/data/boreas}"
-bag_root="${BOREAS_BAG_ROOT:-/mnt/data/boreas/bags}"
+image="${BOREAS_IMAGE:-boreas_to_ros2bag:jazzy}"
+data_root="${BOREAS_DATA_ROOT:-$repo_dir/data}"
+bag_root="${BOREAS_BAG_ROOT:-$repo_dir/bags}"
+data_root="$(cd -- "$data_root" && pwd)"
 mkdir -p "$bag_root"
+bag_root="$(cd -- "$bag_root" && pwd)"
 exec docker run --rm --network none --user "$(id -u):$(id -g)" \
   -e PYTHONDONTWRITEBYTECODE=1 \
   -v "$repo_dir:/converter:ro" \

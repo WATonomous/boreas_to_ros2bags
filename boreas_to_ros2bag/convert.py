@@ -12,13 +12,13 @@ import sys
 import numpy as np
 import rosbag2_py as bag
 from rclpy.serialization import serialize_message
-from sensor_msgs.msg import CameraInfo, Image, Imu, PointCloud2, PointField
+from sensor_msgs.msg import CameraInfo, Image, Imu, NavSatFix, NavSatStatus, PointCloud2, PointField
 from geometry_msgs.msg import TransformStamped
 from std_msgs.msg import Header
 from builtin_interfaces.msg import Time
 from tf2_msgs.msg import TFMessage
 
-from .data import (NS, Orientation, calibration, imu_rows, lidar_points,
+from .data import (BOREAS_ORIGIN, NS, GnssUncertainty, Orientation, calibration, gnss_rows, imu_rows, lidar_points,
                    matrix_quaternion, seconds_ns, sensor_files, stationary_seed)
 
 
@@ -100,18 +100,40 @@ def camera_stream(sequence, files, begin, end):
         yield t, 5, '/boreas/camera/camera_info', info
 
 
+def gnss_stream(sequence, begin, end, uncertainty, status):
+    for t, latitude, longitude, altitude in gnss_rows(sequence):
+        if t >= end:
+            break
+        if t < begin:
+            continue
+        msg = NavSatFix(header=header(t, 'boreas_applanix'),
+                        status=NavSatStatus(status=status, service=0),
+                        latitude=latitude, longitude=longitude, altitude=altitude,
+                        position_covariance_type=NavSatFix.COVARIANCE_TYPE_UNKNOWN)
+        diagonal = uncertainty.diagonal(t)
+        if diagonal is not None:
+            msg.position_covariance = [diagonal[0], 0., 0., 0., diagonal[1], 0., 0., 0., diagonal[2]]
+            msg.position_covariance_type = NavSatFix.COVARIANCE_TYPE_APPROXIMATED
+        yield t, 6, '/boreas/gnss/postprocessed/fix', msg
+
+
 def make_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--input', type=Path, required=True, help='One Boreas sequence directory')
     parser.add_argument('--output', type=Path, required=True, help='New ROS 2 bag directory')
-    parser.add_argument('--sensors', nargs='+', choices=['lidar','imu','camera'], default=['lidar','imu'])
+    parser.add_argument('--sensors', nargs='+', choices=['lidar','imu','camera','gnss'],
+                        default=['lidar','imu'],
+                        help='Streams to export (default: lidar imu); gnss is post-processed ground truth')
     parser.add_argument('--start', default='0', help='Seconds from earliest selected sensor timestamp')
     parser.add_argument('--duration', help='Seconds to export; default all remaining data')
-    parser.add_argument('--no-orientation', action='store_true', help='Export only raw IMU, not Eidos compatible')
+    parser.add_argument('--no-orientation', action='store_true', help='Export raw IMU without estimated orientation')
     parser.add_argument('--seed-seconds', type=float, default=2., help='Initial stationary IMU interval')
     parser.add_argument('--stationary-gyro', type=float, default=0.02, help='Maximum seed gyro norm, rad/s')
     parser.add_argument('--raw-extrinsic', type=Path, help='Override 4x4 T_applanix_raw_imu')
     parser.add_argument('--max-bag-gib', type=float, default=4., help='Split MCAP files at this size')
+    parser.add_argument('--gnss-status', choices=['fix', 'unknown'], default='fix',
+                        help='Post-processed position validity convention: fix=0 (default) or unknown=-2; '
+                             'not a recovered receiver correction mode')
     return parser
 
 
@@ -135,6 +157,9 @@ def convert(args):
             first_stamps.append(files[sensor][0][0])
     if 'imu' in args.sensors:
         first_stamps.append(next(imu_rows(sequence))[0])
+    if 'gnss' in args.sensors:
+        first_stamps.append(next(gnss_rows(sequence))[0])
+    uncertainty = GnssUncertainty(sequence) if 'gnss' in args.sensors else None
     begin = min(first_stamps) + offset
     end = begin + duration if duration else 2**63-1
     edges = calibration(sequence, 'camera' in args.sensors, args.raw_extrinsic)
@@ -150,6 +175,8 @@ def convert(args):
         streams.append(cloud_stream(files['lidar'], begin, end))
     if 'camera' in args.sensors:
         streams.append(camera_stream(sequence, files['camera'], begin, end))
+    if 'gnss' in args.sensors:
+        streams.append(gnss_stream(sequence, begin, end, uncertainty, 0 if args.gnss_status == 'fix' else -2))
     events = heapq.merge(*streams, key=lambda item: item[:2])
     first = next(events, None)
     if first is None:
@@ -210,7 +237,21 @@ def convert(args):
                                for p in sorted((sequence/'calib').glob('*.txt'))},
         'raw_imu_origin': 'ASSUMPTION: no separate raw-IMU lever arm is published; axes-only default '
                           'at Applanix reference origin. Override with --raw-extrinsic if measured.',
-        'ground_truth_used': False,
+        'ground_truth_used': 'gnss' in args.sensors,
+        'gnss': None if 'gnss' not in args.sensors else {
+            'source': 'applanix/gps_post_process.csv',
+            'solution': 'post-processed GNSS/INS ground truth, not raw GNSS',
+            'coordinates': 'ITRF2000 at observation epoch, WGS84 ellipsoid; radians converted to degrees',
+            'frame': 'boreas_applanix; navigation reference point, not a separately calibrated antenna',
+            'altitude': 'WGS84 ellipsoid height reconstructed from the published Boreas ENU origin',
+            'altitude_method': 'boreas_enu_to_wgs84',
+            'enu_origin_lla_rad_rad_m': list(BOREAS_ORIGIN),
+            'status_value': 0 if args.gnss_status == 'fix' else -2,
+            'status_policy': 'fix=0 marks a valid exported post-processed position; unknown=-2 leaves '
+                             'validity unset. Neither recovers receiver fix/correction mode.',
+            'service': 'unknown (0); constellation use is not supplied',
+            'uncertainty': uncertainty.metadata,
+        },
     }
     (output / 'conversion.json').write_text(json.dumps(report, indent=2)+'\n')
     print(json.dumps(report, indent=2))
